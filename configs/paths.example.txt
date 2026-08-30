@@ -1,0 +1,5 @@
+# Example only. Do not commit private machine paths as real config.
+
+DATA_ROOT=D:\\path\\to\\storm_ai_raw_data
+SAT_DENSITY_ZIP=D:\\path\\to\\sat_density (1).zip
+SUBSTEP_1_3_OUTPUT=D:\\path\\to\\storm_ai_clean\\experiments\\exp001_sat_density_sample_audit\\outputs\\substep_1_3_pilot
