@@ -67,6 +67,11 @@ OVERLAP_COLUMNS = [
     "actual_timestamp_overlap_count", "actual_overlap_start", "actual_overlap_end",
     "timestamp_key_policy", "actual_overlap_method",
 ]
+SATELLITE_INTERVAL_COLUMNS = [
+    "left_satellite", "right_satellite", "timestamp_kind",
+    "overlap_start", "overlap_end", "overlap_seconds", "overlap_days",
+    "contributing_file_pair_count", "exact_timestamp_overlap_count",
+]
 
 
 def _json(value: Any) -> str:
@@ -428,6 +433,112 @@ def cross_satellite_overlaps(audits: Sequence[FileAudit]) -> list[dict[str, Any]
     return rows
 
 
+def cross_satellite_interval_overlaps(audits: Sequence[FileAudit]) -> list[dict[str, Any]]:
+    """Return merged calendar intervals where two satellites have coverage.
+
+    This is deliberately interval-based: calibration windows need overlapping
+    coverage even when the two satellites sampled at slightly different
+    timestamps. Exact timestamp intersections remain reported separately.
+    """
+    groups: dict[str, list[FileAudit]] = defaultdict(list)
+    for item in audits:
+        if item.record["satellite"] != "unclassified" and _interval(item):
+            groups[item.record["satellite"]].append(item)
+    rows: list[dict[str, Any]] = []
+    for left_satellite, right_satellite in itertools.combinations(sorted(groups), 2):
+        intersections: dict[str, list[tuple[int, int, int]]] = defaultdict(list)
+        for left in groups[left_satellite]:
+            left_interval = _interval(left)
+            if not left_interval:
+                continue
+            for right in groups[right_satellite]:
+                right_interval = _interval(right)
+                if not right_interval or left_interval[0] != right_interval[0]:
+                    continue
+                start, end = max(left_interval[1], right_interval[1]), min(left_interval[2], right_interval[2])
+                if start <= end:
+                    intersections[left_interval[0]].append((start, end, 1))
+        for kind, values in intersections.items():
+            merged: list[list[int]] = []
+            for start, end, count in sorted(values):
+                if merged and start <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], end)
+                    merged[-1][2] += count
+                else:
+                    merged.append([start, end, count])
+            for start, end, pair_count in merged:
+                rows.append({
+                    "left_satellite": left_satellite,
+                    "right_satellite": right_satellite,
+                    "timestamp_kind": kind,
+                    "overlap_start": _display_key(kind, start),
+                    "overlap_end": _display_key(kind, end),
+                    "overlap_seconds": (end - start) / 1e9,
+                    "overlap_days": (end - start) / 86_400e9,
+                    "contributing_file_pair_count": pair_count,
+                    "exact_timestamp_overlap_count": "",
+                })
+    return sorted(rows, key=lambda row: (row["left_satellite"], row["right_satellite"], row["overlap_start"]))
+
+
+def _write_human_overlap_report(path: Path, interval_rows: Sequence[Mapping[str, Any]],
+                                 exact_rows: Sequence[Mapping[str, Any]], summary: Mapping[str, Any]):
+    lines = [
+        "# Cross-satellite overlap report",
+        "",
+        f"- Mode: `{summary['mode']}`",
+        f"- ZIP SHA-256: `{summary['zip_sha256']}`",
+        f"- CSV files audited: `{summary['n_files_audited']}`",
+        "",
+        "This report identifies calendar coverage intervals shared by two satellites.",
+        "It is the primary human-readable input for selecting calibration windows.",
+        "An interval overlap does not imply identical timestamps; exact timestamp",
+        "intersections are listed separately.",
+        "",
+        "## Shared coverage intervals",
+        "",
+        "| Pair | Time basis | Start | End | Days | File-pair contributions |",
+        "|---|---|---|---|---:|---:|",
+    ]
+    if interval_rows:
+        for row in interval_rows:
+            lines.append(
+                f"| `{row['left_satellite']} + {row['right_satellite']}` | "
+                f"`{row['timestamp_kind']}` | `{row['overlap_start']}` | "
+                f"`{row['overlap_end']}` | {float(row['overlap_days']):.6f} | "
+                f"{row['contributing_file_pair_count']} |"
+            )
+    else:
+        lines.append("| No cross-satellite interval overlap found |  |  |  |  |  |")
+    lines.extend([
+        "",
+        "## Exact timestamp intersections (summary)",
+        "",
+        "| Pair | Exact shared timestamps | First | Last |",
+        "|---|---:|---|---|",
+    ])
+    exact_cross = [row for row in exact_rows if row["pair_scope"] == "cross-satellite-pair"]
+    if exact_cross:
+        for row in exact_cross:
+            lines.append(
+                f"| `{row['left_satellite']} + {row['right_satellite']}` | "
+                f"{row['actual_timestamp_overlap_count']} | "
+                f"`{row['actual_overlap_start'] or 'none'}` | "
+                f"`{row['actual_overlap_end'] or 'none'}` |"
+            )
+    else:
+        lines.append("| No exact timestamp intersections reported |  |  |  |")
+    lines.extend([
+        "",
+        "## Interpretation",
+        "",
+        "- Use shared coverage intervals to choose candidate calibration windows.",
+        "- Use exact timestamp counts to decide whether direct timestamp pairing is possible.",
+        "- Check `timestamp_kind`: timezone-naive and timezone-aware timelines are never mixed.",
+    ])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def aggregate_satellites(audits: Sequence[FileAudit]) -> list[dict[str, Any]]:
     groups: dict[str, list[FileAudit]] = defaultdict(list)
     for item in audits: groups[item.record["satellite"]].append(item)
@@ -534,6 +645,8 @@ def run_audit(zip_path: Path, output_dir: Path, *, mode: str, max_files: int | N
     ])
     overlap_rows = within_satellite_overlaps(audits) + cross_satellite_overlaps(audits)
     _write_csv(output_dir / "satellite_overlap_pairs.csv", overlap_rows, OVERLAP_COLUMNS)
+    interval_rows = cross_satellite_interval_overlaps(audits)
+    _write_csv(output_dir / "satellite_overlap_intervals.csv", interval_rows, SATELLITE_INTERVAL_COLUMNS)
     n_pass = sum(item.record["file_status"] == "PASS" for item in audits)
     n_check = sum(item.record["file_status"] == "CHECK" for item in audits)
     n_error = sum(item.record["file_status"] == "ERROR" for item in audits)
@@ -571,7 +684,11 @@ def run_audit(zip_path: Path, output_dir: Path, *, mode: str, max_files: int | N
         "started_at": started_at,
         "finished_at": datetime.now().astimezone().isoformat(),
         "timestamp_key_policy": "timezone-naive keys remain separate; timezone-aware keys normalize to UTC for comparison only",
-        "outputs": {name: str(output_dir / name) for name in ("full_file_schema_time_audit.csv", "satellite_summary.csv", "satellite_overlap_pairs.csv", "audit_run_summary.json", "audit_run_log.md")},
+        "outputs": {name: str(output_dir / name) for name in (
+            "full_file_schema_time_audit.csv", "satellite_summary.csv",
+            "satellite_overlap_pairs.csv", "satellite_overlap_intervals.csv",
+            "satellite_overlap_report.md", "audit_run_summary.json", "audit_run_log.md"
+        )},
     }
     (output_dir / "audit_run_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     log = [
@@ -589,9 +706,11 @@ def run_audit(zip_path: Path, output_dir: Path, *, mode: str, max_files: int | N
         "## Selection", "",
     ]
     log.extend(f"- `{entry['member']}` — {entry['reason']}" for entry in selection)
+    _write_human_overlap_report(output_dir / "satellite_overlap_report.md", interval_rows, overlap_rows, summary)
     log.extend(["", "## Methodology", "", "- Interval overlap uses `[max(min_A,min_B), min(max_A,max_B)]`.",
                 "- Actual overlap uses exact nanosecond keys; naive and aware keys are never conflated.",
-                "- Within-satellite overlap uses a sorted interval sweep; cross-satellite overlap uses per-satellite timestamp unions.",
+                "- Within-satellite overlap uses a sorted interval sweep; cross-satellite exact overlap uses per-satellite timestamp unions.",
+                "- Cross-satellite calibration windows use merged intersections of per-file coverage intervals.",
                 "- A pilot is not evidence for the untested archive.", "", "## Outputs", ""])
     log.extend(f"- `{path}`" for path in summary["outputs"].values())
     (output_dir / "audit_run_log.md").write_text("\n".join(log) + "\n", encoding="utf-8")
